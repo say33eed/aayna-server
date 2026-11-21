@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import { env } from "./config/env.js";
+import { servicesRouter } from "./routes/services.js";
 import { healthRouter } from "./routes/health.js";
 import { errorHandler, notFound } from "./middleware/error-handler.js";
 
@@ -19,6 +20,7 @@ app.use(cors({
     callback(new Error("Origin not allowed by CORS."));
   },
   credentials: true,
+  exposedHeaders: ["ETag"],
 }));
 app.use(express.json({ limit: "100kb" }));
 
@@ -27,5 +29,6 @@ app.get("/", (_req, res) => {
 });
 app.use("/health", healthRouter);
 
+app.use("/api/services", servicesRouter);
 app.use(notFound);
 app.use(errorHandler);
