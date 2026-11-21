@@ -17,7 +17,13 @@ if (clientOrigins.length === 0 || clientOrigins.some((origin) => !/^https?:\/\/[
   throw new Error("CLIENT_ORIGIN must contain valid HTTP(S) origins separated by commas.");
 }
 
+const mongodbUri = process.env.MONGODB_URI?.trim();
+if (!mongodbUri || !/^mongodb(?:\+srv)?:\/\//.test(mongodbUri)) {
+  throw new Error("MONGODB_URI must be a valid MongoDB connection string.");
+}
+
 export const env = {
+  mongodbUri,
   nodeEnv: process.env.NODE_ENV ?? "development",
   port: parsePort(process.env.PORT),
   clientOrigins,
