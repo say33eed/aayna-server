@@ -18,9 +18,7 @@ if (clientOrigins.length === 0 || clientOrigins.some((origin) => !/^https?:\/\/[
 }
 
 const mongodbUri = process.env.MONGODB_URI?.trim();
-if (!mongodbUri || !/^mongodb(?:\+srv)?:\/\//.test(mongodbUri)) {
-  throw new Error("MONGODB_URI must be a valid MongoDB connection string.");
-}
+
 
 export const env = {
   mongodbUri,
