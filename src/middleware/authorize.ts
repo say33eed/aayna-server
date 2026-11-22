@@ -1,0 +1,73 @@
+import type { Request, RequestHandler } from "express";
+import { createHash } from "node:crypto";
+import jwt, { type JwtPayload } from "jsonwebtoken";
+import { ObjectId } from "mongodb";
+import { auth } from "../auth.js";
+import { env } from "../config/env.js";
+import { getDatabase } from "../config/database.js";
+
+export type UserRole = "customer" | "admin";
+export type AuthenticatedUser = { id: string; role: UserRole; isBlocked: boolean };
+declare global { namespace Express { interface Request { authenticatedUser?: AuthenticatedUser } } }
+
+// A domain-separated signing key avoids reusing the Better Auth secret directly as a JWT key.
+const jwtKey = createHash("sha256").update(`aayna:api-jwt:v1:${env.auth.secret}`).digest();
+const issuer = "aayna-api";
+const audience = "aayna-api-client";
+
+function requestHeaders(req: Request): Headers {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (typeof value === "string") headers.set(name, value);
+    else if (Array.isArray(value)) headers.set(name, value.join(", "));
+  }
+  return headers;
+}
+
+export function issueApiToken(userId: string): string {
+  return jwt.sign({}, jwtKey, { algorithm: "HS256", subject: userId, issuer, audience, expiresIn: "15m" });
+}
+
+// Checks signature, algorithm, issuer, audience, expiry, and subject.
+export function verifyApiJwt(token: string): string | null {
+  try {
+    const payload = jwt.verify(token, jwtKey, { algorithms: ["HS256"], issuer, audience }) as JwtPayload;
+    return typeof payload.sub === "string" && payload.sub.length > 0 ? payload.sub : null;
+  } catch { return null; }
+}
+
+async function identify(req: Request): Promise<string | null> {
+  const authorization = req.headers.authorization;
+  if (authorization !== undefined) {
+    const match = /^Bearer (\S+)$/i.exec(authorization);
+    return match ? verifyApiJwt(match[1]!) : null; // Never fall back on a malformed bearer token.
+  }
+  const session = await auth.api.getSession({ headers: requestHeaders(req) });
+  return session?.user?.id ?? null;
+}
+
+export const requireAuth: RequestHandler = async (req, res, next) => {
+  try {
+    const id = await identify(req);
+    if (!id) { res.status(401).json({ success: false, message: "Please sign in." }); return; }
+    const db = await getDatabase();
+    // Better Auth uses string IDs; support legacy ObjectId records defensively.
+    const candidates: Array<string | ObjectId> = [id];
+    if (ObjectId.isValid(id) && String(new ObjectId(id)) === id.toLowerCase()) candidates.push(new ObjectId(id));
+    const record = await db.collection("user").findOne({ _id: { $in: candidates as ObjectId[] } }, { projection: { role: 1, isBlocked: 1 } });
+    if (!record) { res.status(401).json({ success: false, message: "Account not found." }); return; }
+    if (record.isBlocked === true) { res.status(403).json({ success: false, message: "Account access is restricted." }); return; }
+    const role = record.role === "admin" ? "admin" : record.role === "customer" || record.role == null ? "customer" : null;
+    if (!role) { res.status(403).json({ success: false, message: "Invalid account role." }); return; }
+    req.authenticatedUser = { id, role, isBlocked: false };
+    next();
+  } catch (error) { next(error); }
+};
+
+export function requireRole(role: UserRole): RequestHandler {
+  return (req, res, next) => {
+    if (!req.authenticatedUser) { res.status(401).json({ success: false, message: "Please sign in." }); return; }
+    if (req.authenticatedUser.role !== role) { res.status(403).json({ success: false, message: "Access denied." }); return; }
+    next();
+  };
+}

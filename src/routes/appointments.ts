@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { ObjectId, MongoServerError } from "mongodb";
-import { auth } from "../auth.js";
+import { requireAuth, requireRole } from "../middleware/authorize.js";
 import { getDatabase } from "../config/database.js";
 
 export const appointmentsRouter = Router();
@@ -14,15 +14,6 @@ const dhakaNow = () => {
 };
 const isFutureOrToday = (value: string) => value >= dhakaNow().slice(0, 10);
 const isUpcomingSlot = (date: string, time: string) => `${date} ${time}` > dhakaNow();
-
-async function sessionFor(req: import("express").Request) {
-  const headers = new Headers();
-  for (const [key, value] of Object.entries(req.headers)) {
-    if (typeof value === "string") headers.set(key, value);
-    else if (Array.isArray(value)) headers.set(key, value.join(", "));
-  }
-  return auth.api.getSession({ headers });
-}
 
 appointmentsRouter.get("/slots", async (req, res) => {
   const serviceId = req.query.serviceId;
@@ -41,13 +32,9 @@ appointmentsRouter.get("/slots", async (req, res) => {
   } catch { res.status(503).json({ success: false, message: "Unable to load time slots." }); }
 });
 
-appointmentsRouter.post("/", async (req, res) => {
+appointmentsRouter.post("/", requireAuth, requireRole("customer"), async (req, res) => {
   try {
-    const session = await sessionFor(req);
-    if (!session?.user) { res.status(401).json({ success: false, message: "Sign in to request an appointment." }); return; }
-    const user = session.user as typeof session.user & { role?: string; isBlocked?: boolean };
-    if (user.isBlocked) { res.status(403).json({ success: false, message: "Your account cannot book appointments." }); return; }
-    if (user.role !== "customer") { res.status(403).json({ success: false, message: "Only customer accounts can request appointments." }); return; }
+    const user = req.authenticatedUser!;
     const { serviceId, appointmentDate, timeSlot, message } = req.body ?? {};
     if (typeof serviceId !== "string" || !ObjectId.isValid(serviceId) || !validDate(appointmentDate) || !isFutureOrToday(appointmentDate) || !TIME_SLOTS.includes(timeSlot) || !isUpcomingSlot(appointmentDate, timeSlot)) {
       res.status(400).json({ success: false, message: "Select a valid service, future date, and time slot." }); return;

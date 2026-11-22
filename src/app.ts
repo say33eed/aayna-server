@@ -7,6 +7,7 @@ import { env } from "./config/env.js";
 import { servicesRouter } from "./routes/services.js";
 import { appointmentsRouter } from "./routes/appointments.js";
 import { healthRouter } from "./routes/health.js";
+import { requireAuth, issueApiToken } from "./middleware/authorize.js";
 import { errorHandler, notFound } from "./middleware/error-handler.js";
 
 export const app = express();
@@ -33,6 +34,11 @@ app.get("/", (_req, res) => {
   res.json({ success: true, message: "AAYNA API", data: { health: "/health" } });
 });
 app.use("/health", healthRouter);
+
+// Optional short-lived JWT for API clients; existing browser sessions continue working.
+app.post("/api/session/token", requireAuth, (req, res) => {
+  res.set("Cache-Control", "no-store").json({ success: true, data: { token: issueApiToken(req.authenticatedUser!.id), expiresIn: 900 } });
+});
 
 app.use("/api/services", servicesRouter);
 app.use("/api/appointments", appointmentsRouter);
