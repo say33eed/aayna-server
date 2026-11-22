@@ -21,6 +21,15 @@ export const auth = betterAuth({
     minPasswordLength: 6,
   },
   socialProviders,
+  // Frame v015 production fix: allow OAuth state/session cookies to survive
+  // the cross-site Vercel -> Render authentication flow.
+  // Secure is mandatory when SameSite=None.
+  advanced: {
+    useSecureCookies: env.nodeEnv === "production",
+    defaultCookieAttributes: env.nodeEnv === "production"
+      ? { sameSite: "none", secure: true, httpOnly: true }
+      : { sameSite: "lax", secure: false, httpOnly: true },
+  },
   user: {
     additionalFields: {
       role: { type: "string", required: false, defaultValue: "customer", input: false },
