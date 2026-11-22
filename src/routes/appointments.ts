@@ -32,6 +32,81 @@ appointmentsRouter.get("/slots", async (req, res) => {
   } catch { res.status(503).json({ success: false, message: "Unable to load time slots." }); }
 });
 
+// Customer overview: scoped on the server to the authenticated account.
+appointmentsRouter.get("/my-summary", requireAuth, requireRole("customer"), async (req, res) => {
+  try {
+    const db = await getDatabase();
+    const customerId = req.authenticatedUser!.id;
+    const rows = await db.collection("appointments").aggregate<{ _id: string; count: number }>([
+      { $match: { customerId } },
+      { $group: { _id: "$status", count: { $sum: 1 } } },
+    ]).toArray();
+    const counts = { total: 0, pending: 0, confirmed: 0, cancelled: 0 };
+    for (const row of rows) {
+      counts.total += row.count;
+      if (row._id === "pending" || row._id === "confirmed" || row._id === "cancelled") {
+        counts[row._id] += row.count;
+      }
+    }
+    res.set("Cache-Control", "private, no-store").json({ success: true, data: counts });
+  } catch {
+    res.status(503).json({ success: false, message: "Unable to load appointment statistics." });
+  }
+});
+
+// Customer appointment history: the identity is taken from the verified session, never the query.
+appointmentsRouter.get("/mine", requireAuth, requireRole("customer"), async (req, res) => {
+  try {
+    const db = await getDatabase();
+    const customerId = req.authenticatedUser!.id;
+    const records = await db.collection("appointments").find({ customerId })
+      .sort({ createdAt: -1, _id: -1 }).limit(200).toArray();
+    const ids = [...new Set(records.map((row) => row.serviceId).filter((id): id is string => typeof id === "string" && ObjectId.isValid(id)))];
+    const services = ids.length ? await db.collection("services").find({ _id: { $in: ids.map((id) => new ObjectId(id)) } }, { projection: { name: 1, title: 1, category: 1, image: 1, imageUrl: 1, images: 1 } }).toArray() : [];
+    const serviceMap = new Map(services.map((service) => [String(service._id), service]));
+    const data = records.map((row) => {
+      const service = serviceMap.get(String(row.serviceId));
+      const image = typeof service?.imageUrl === "string" ? service.imageUrl : typeof service?.image === "string" ? service.image : Array.isArray(service?.images) && typeof service.images[0] === "string" ? service.images[0] : null;
+      return {
+        id: String(row._id), serviceName: typeof service?.name === "string" ? service.name : typeof service?.title === "string" ? service.title : "Service unavailable",
+        serviceCategory: typeof service?.category === "string" ? service.category : "Uncategorized", serviceImage: image,
+        appointmentDate: row.appointmentDate, timeSlot: row.timeSlot, servicePrice: row.servicePrice,
+        status: row.status, paymentStatus: row.paymentStatus,
+        createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : String(row.createdAt ?? ""),
+        message: typeof row.message === "string" ? row.message : "",
+      };
+    });
+    res.set("Cache-Control", "private, no-store").json({ success: true, data });
+  } catch {
+    res.status(503).json({ success: false, message: "Unable to load your appointments." });
+  }
+});
+
+// Cancellation is an atomic, customer-owned pending -> cancelled transition.
+// Unsetting slotKey releases the unique slot reservation for future bookings.
+appointmentsRouter.patch("/:id/cancel", requireAuth, requireRole("customer"), async (req, res) => {
+  const id = req.params.id;
+  if (typeof id !== "string" || !ObjectId.isValid(id)) {
+    res.status(400).json({ success: false, message: "Invalid appointment ID." }); return;
+  }
+  try {
+    const db = await getDatabase();
+    const appointments = db.collection("appointments");
+    const result = await appointments.updateOne(
+      { _id: new ObjectId(id), customerId: req.authenticatedUser!.id, status: "pending", paymentStatus: "unpaid" },
+      { $set: { status: "cancelled", updatedAt: new Date() }, $unset: { slotKey: "" } },
+    );
+    if (result.modifiedCount === 1) {
+      res.set("Cache-Control", "no-store").json({ success: true, message: "Appointment cancelled." }); return;
+    }
+    // Avoid disclosing other customers' appointments.
+    const own = await appointments.findOne({ _id: new ObjectId(id), customerId: req.authenticatedUser!.id }, { projection: { status: 1 } });
+    res.status(own ? 409 : 404).json({ success: false, message: own ? "Only pending, unpaid appointments can be cancelled." : "Appointment not found." });
+  } catch {
+    res.status(503).json({ success: false, message: "Unable to cancel appointment right now." });
+  }
+});
+
 appointmentsRouter.post("/", requireAuth, requireRole("customer"), async (req, res) => {
   try {
     const user = req.authenticatedUser!;
