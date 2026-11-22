@@ -1,4 +1,6 @@
 import express from "express";
+import { toNodeHandler } from "better-auth/node";
+import { auth } from "./auth.js";
 import cors from "cors";
 import helmet from "helmet";
 import { env } from "./config/env.js";
@@ -22,6 +24,8 @@ app.use(cors({
   credentials: true,
   exposedHeaders: ["ETag"],
 }));
+// Better Auth must receive the unparsed request before express.json().
+app.all("/api/auth/*", toNodeHandler(auth));
 app.use(express.json({ limit: "100kb" }));
 
 app.get("/", (_req, res) => {
