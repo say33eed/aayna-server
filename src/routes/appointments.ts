@@ -62,13 +62,13 @@ appointmentsRouter.get("/mine", requireAuth, requireRole("customer"), async (req
     const records = await db.collection("appointments").find({ customerId })
       .sort({ createdAt: -1, _id: -1 }).limit(200).toArray();
     const ids = [...new Set(records.map((row) => row.serviceId).filter((id): id is string => typeof id === "string" && ObjectId.isValid(id)))];
-    const services = ids.length ? await db.collection("services").find({ _id: { $in: ids.map((id) => new ObjectId(id)) } }, { projection: { name: 1, title: 1, category: 1, image: 1, imageUrl: 1, images: 1 } }).toArray() : [];
+    const services = ids.length ? await db.collection("services").find({ _id: { $in: ids.map((id) => new ObjectId(id)) } }, { projection: { serviceName: 1, name: 1, title: 1, category: 1, image: 1, imageUrl: 1, images: 1 } }).toArray() : [];
     const serviceMap = new Map(services.map((service) => [String(service._id), service]));
     const data = records.map((row) => {
       const service = serviceMap.get(String(row.serviceId));
       const image = typeof service?.imageUrl === "string" ? service.imageUrl : typeof service?.image === "string" ? service.image : Array.isArray(service?.images) && typeof service.images[0] === "string" ? service.images[0] : null;
       return {
-        id: String(row._id), serviceName: typeof service?.name === "string" ? service.name : typeof service?.title === "string" ? service.title : "Service unavailable",
+        id: String(row._id), serviceId: typeof row.serviceId === "string" ? row.serviceId : "", serviceName: typeof service?.serviceName === "string" ? service.serviceName : typeof service?.name === "string" ? service.name : typeof service?.title === "string" ? service.title : "Service no longer listed",
         serviceCategory: typeof service?.category === "string" ? service.category : "Uncategorized", serviceImage: image,
         appointmentDate: row.appointmentDate, timeSlot: row.timeSlot, servicePrice: row.servicePrice,
         status: row.status, paymentStatus: row.paymentStatus,
@@ -105,6 +105,44 @@ appointmentsRouter.patch("/:id/cancel", requireAuth, requireRole("customer"), as
   } catch {
     res.status(503).json({ success: false, message: "Unable to cancel appointment right now." });
   }
+});
+
+// Admin-only appointment management. Status transitions are atomic and payment state is immutable here.
+appointmentsRouter.get("/admin/all", requireAuth, requireRole("admin"), async (req, res) => {
+  try {
+    const db = await getDatabase();
+    const records = await db.collection("appointments").find({}).sort({ createdAt: -1, _id: -1 }).limit(500).toArray();
+    const serviceIds = [...new Set(records.map(r => r.serviceId).filter((id): id is string => typeof id === "string" && ObjectId.isValid(id)))];
+    const customerIds = [...new Set(records.map(r => r.customerId).filter((id): id is string => typeof id === "string"))];
+    const services = serviceIds.length ? await db.collection("services").find({ _id: { $in: serviceIds.map(id => new ObjectId(id)) } }, { projection: { serviceName: 1, name: 1, title: 1, category: 1 } }).toArray() : [];
+    const customerKeys = customerIds.flatMap(id => ObjectId.isValid(id) && String(new ObjectId(id)) === id.toLowerCase() ? [id, new ObjectId(id)] : [id]);
+    const customers = customerKeys.length ? await db.collection("user").find({ _id: { $in: customerKeys as ObjectId[] } }, { projection: { name: 1, email: 1 } }).toArray() : [];
+    const serviceMap = new Map(services.map(r => [String(r._id), r]));
+    const customerMap = new Map(customers.map(r => [String(r._id), r]));
+    const data = records.map(r => {
+      const service = serviceMap.get(String(r.serviceId)); const customer = customerMap.get(String(r.customerId));
+      return { id: String(r._id), serviceId: typeof r.serviceId === "string" ? r.serviceId : "", customerName: typeof customer?.name === "string" ? customer.name : "Customer", customerEmail: typeof customer?.email === "string" ? customer.email : "", serviceName: typeof service?.serviceName === "string" ? service.serviceName : typeof service?.name === "string" ? service.name : typeof service?.title === "string" ? service.title : "Service no longer listed", category: typeof service?.category === "string" ? service.category : "", appointmentDate: r.appointmentDate, timeSlot: r.timeSlot, servicePrice: r.servicePrice, status: r.status, paymentStatus: r.paymentStatus, message: typeof r.message === "string" ? r.message : "", createdAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : String(r.createdAt ?? "") };
+    });
+    res.set("Cache-Control", "private, no-store").json({ success: true, data });
+  } catch { res.status(503).json({ success: false, message: "Unable to load appointments." }); }
+});
+
+appointmentsRouter.patch("/admin/:id/status", requireAuth, requireRole("admin"), async (req, res) => {
+  const id = req.params.id; const action = req.body?.action;
+  if (typeof id !== "string" || !ObjectId.isValid(id) || (action !== "confirm" && action !== "cancel")) {
+    res.status(400).json({ success: false, message: "Invalid appointment or action." }); return;
+  }
+  try {
+    const appointments = (await getDatabase()).collection("appointments");
+    const filter = { _id: new ObjectId(id), status: action === "confirm" ? "pending" : { $in: ["pending", "confirmed"] } };
+    const update = action === "confirm"
+      ? { $set: { status: "confirmed", updatedAt: new Date() } }
+      : { $set: { status: "cancelled", updatedAt: new Date() }, $unset: { slotKey: "" } };
+    const result = await appointments.updateOne(filter, update);
+    if (result.modifiedCount) { res.set("Cache-Control", "no-store").json({ success: true, message: action === "confirm" ? "Appointment confirmed." : "Appointment cancelled." }); return; }
+    const exists = await appointments.findOne({ _id: new ObjectId(id) }, { projection: { _id: 1 } });
+    res.status(exists ? 409 : 404).json({ success: false, message: exists ? "This appointment can no longer be changed." : "Appointment not found." });
+  } catch { res.status(503).json({ success: false, message: "Unable to update appointment." }); }
 });
 
 appointmentsRouter.post("/", requireAuth, requireRole("customer"), async (req, res) => {

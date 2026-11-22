@@ -5,8 +5,11 @@ import cors from "cors";
 import helmet from "helmet";
 import { env } from "./config/env.js";
 import { servicesRouter } from "./routes/services.js";
+import { adminServicesRouter } from "./routes/admin-services.js";
+import { adminOverviewRouter } from "./routes/admin-overview.js";
 import { appointmentsRouter } from "./routes/appointments.js";
 import { healthRouter } from "./routes/health.js";
+import { paymentsRouter, stripeWebhook } from "./routes/payments.js";
 import { requireAuth, issueApiToken } from "./middleware/authorize.js";
 import { errorHandler, notFound } from "./middleware/error-handler.js";
 
@@ -28,6 +31,8 @@ app.use(cors({
 }));
 // Better Auth must receive the unparsed request before express.json().
 app.all("/api/auth/*", toNodeHandler(auth));
+app.post("/api/payments/webhook", express.raw({ type: "application/json", limit: "100kb" }), stripeWebhook);
+app.use("/api/admin/services/image", express.json({ limit: "8mb" }));
 app.use(express.json({ limit: "100kb" }));
 
 app.get("/", (_req, res) => {
@@ -42,5 +47,8 @@ app.post("/api/session/token", requireAuth, (req, res) => {
 
 app.use("/api/services", servicesRouter);
 app.use("/api/appointments", appointmentsRouter);
+app.use("/api/admin/overview", adminOverviewRouter);
+app.use("/api/admin/services", adminServicesRouter);
+app.use("/api/payments", paymentsRouter);
 app.use(notFound);
 app.use(errorHandler);

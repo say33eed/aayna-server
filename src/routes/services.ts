@@ -1,8 +1,14 @@
 import { Router } from "express";
 import { createHash } from "node:crypto";
 import { getDatabase } from "../config/database.js";
+import { listServiceCategories } from "../lib/service-categories.js";
 
 export const servicesRouter = Router();
+
+servicesRouter.get("/categories", async (_req, res) => {
+  try { res.set("Cache-Control", "no-store").json({ success: true, data: await listServiceCategories() }); }
+  catch { res.status(503).json({ success: false, message: "Categories are temporarily unavailable." }); }
+});
 
 let pending: Promise<{ body: string; tag: string }> | undefined;
 
@@ -23,6 +29,7 @@ function load() {
             price: 1,
             duration: 1,
             image: 1,
+            images: 1,
           },
           maxTimeMS: 5000,
         },
