@@ -5,6 +5,7 @@ import cors from "cors";
 import helmet from "helmet";
 import { env } from "./config/env.js";
 import { servicesRouter } from "./routes/services.js";
+import { appointmentsRouter } from "./routes/appointments.js";
 import { healthRouter } from "./routes/health.js";
 import { errorHandler, notFound } from "./middleware/error-handler.js";
 
@@ -34,5 +35,6 @@ app.get("/", (_req, res) => {
 app.use("/health", healthRouter);
 
 app.use("/api/services", servicesRouter);
+app.use("/api/appointments", appointmentsRouter);
 app.use(notFound);
 app.use(errorHandler);
