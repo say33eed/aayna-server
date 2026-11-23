@@ -27,7 +27,7 @@ const serialize = (row: Record<string, unknown>) => ({ ...row, _id: String(row._
 
 adminServicesRouter.get("/", async (_req, res, next) => {
   try {
-    const rows = await (await getDatabase()).collection("services").find({}).sort({ createdAt: -1, _id: -1 }).limit(500).toArray();
+    const rows = await (await getDatabase()).collection("services").find({ archivedAt: { $exists: false } }).sort({ createdAt: -1, _id: -1 }).limit(500).toArray();
     res.set("Cache-Control", "no-store").json({ success: true, data: rows.map(serialize) });
   } catch (error) { next(error); }
 });
@@ -179,9 +179,18 @@ adminServicesRouter.delete("/:id", async (req, res, next) => {
   try {
     const db = await getDatabase();
     const inUse = await db.collection("appointments").findOne({ serviceId: req.params.id });
-    if (inUse) { res.status(409).json({ success: false, message: "This service has appointment history. Deactivate it instead to preserve records." }); return; }
-    const result = await db.collection("services").deleteOne({ _id: new ObjectId(req.params.id) });
+    if (inUse) {
+      // Historical appointments and financial records must retain their service reference.
+      // Archive the catalog entry instead of deleting it from MongoDB.
+      const result = await db.collection("services").updateOne(
+        { _id: new ObjectId(req.params.id), archivedAt: { $exists: false } },
+        { $set: { status: "inactive", archivedAt: new Date(), updatedAt: new Date() } },
+      );
+      if (!result.matchedCount) { res.status(404).json({ success: false, message: "Service not found." }); return; }
+      res.json({ success: true, message: "Service removed from the catalog. Appointment and payment history is preserved.", data: { archived: true } }); return;
+    }
+    const result = await db.collection("services").deleteOne({ _id: new ObjectId(req.params.id), archivedAt: { $exists: false } });
     if (!result.deletedCount) { res.status(404).json({ success: false, message: "Service not found." }); return; }
-    res.json({ success: true, message: "Service deleted." });
+    res.json({ success: true, message: "Service deleted.", data: { archived: false } });
   } catch (error) { next(error); }
 });

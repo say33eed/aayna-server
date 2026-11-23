@@ -134,20 +134,37 @@ appointmentsRouter.patch("/admin/:id/status", requireAuth, requireRole("admin"),
   }
   try {
     const appointments = (await getDatabase()).collection("appointments");
-    const filter = action === "confirm"
-      ? { _id: new ObjectId(id), status: "pending" }
-      : { _id: new ObjectId(id), status: { $in: ["pending", "confirmed"] },
-          paymentStatus: "unpaid", $or: [
-            { checkoutExpiresAt: { $exists: false } },
-            { checkoutExpiresAt: { $lte: new Date() } },
-          ] };
-    const update = action === "confirm"
-      ? { $set: { status: "confirmed", updatedAt: new Date() } }
-      : { $set: { status: "cancelled", updatedAt: new Date() }, $unset: { slotKey: "" } };
-    const result = await appointments.updateOne(filter, update);
-    if (result.modifiedCount) { res.set("Cache-Control", "no-store").json({ success: true, message: action === "confirm" ? "Appointment confirmed." : "Appointment cancelled." }); return; }
-    const exists = await appointments.findOne({ _id: new ObjectId(id) }, { projection: { _id: 1 } });
-    res.status(exists ? 409 : 404).json({ success: false, message: exists ? "This appointment cannot be changed while payment is pending or completed." : "Appointment not found." });
+    const key = new ObjectId(id);
+    const now = new Date();
+    const current = await appointments.findOne({ _id: key }, { projection: { status: 1, paymentStatus: 1, checkoutExpiresAt: 1 } });
+    if (!current) { res.status(404).json({ success: false, message: "Appointment not found." }); return; }
+    if (action === "confirm") {
+      const result = await appointments.updateOne({ _id: key, status: "pending" }, { $set: { status: "confirmed", updatedAt: now } });
+      res.status(result.modifiedCount ? 200 : 409).json({ success: Boolean(result.modifiedCount), message: result.modifiedCount ? "Appointment confirmed." : "Only pending appointments can be confirmed." }); return;
+    }
+    if (current.status !== "pending" && current.status !== "confirmed") {
+      res.status(409).json({ success: false, message: "This appointment is already cancelled." }); return;
+    }
+    if (current.paymentStatus === "paid") {
+      // Admin cancellation does NOT refund money. Preserve the paid state and flag review.
+      // Payment state is still written exclusively by the verified Stripe webhook.
+      const result = await appointments.updateOne(
+        { _id: key, status: { $in: ["pending", "confirmed"] }, paymentStatus: "paid" },
+        { $set: { status: "cancelled", refundStatus: "review_required", updatedAt: now }, $unset: { slotKey: "" } },
+      );
+      if (!result.modifiedCount) { res.status(409).json({ success: false, message: "Appointment changed; refresh and try again." }); return; }
+      res.set("Cache-Control", "no-store").json({ success: true, message: "Paid appointment cancelled. Payment remains paid; refund review is required.", data: { refundReviewRequired: true } }); return;
+    }
+    if (current.paymentStatus !== "unpaid") {
+      res.status(409).json({ success: false, message: "Payment status needs review before cancellation." }); return;
+    }
+    // A live checkout session may complete before its webhook arrives: never cancel it.
+    const filter = { _id: key, status: { $in: ["pending", "confirmed"] }, paymentStatus: "unpaid", $or: [
+      { checkoutExpiresAt: { $exists: false } }, { checkoutExpiresAt: { $lte: now } },
+    ] };
+    const result = await appointments.updateOne(filter, { $set: { status: "cancelled", updatedAt: now }, $unset: { slotKey: "" } });
+    if (result.modifiedCount) { res.set("Cache-Control", "no-store").json({ success: true, message: "Appointment cancelled." }); return; }
+    res.status(409).json({ success: false, message: "Checkout may still be processing. Wait for Stripe webhook confirmation before cancelling." });
   } catch { res.status(503).json({ success: false, message: "Unable to update appointment." }); }
 });
 
