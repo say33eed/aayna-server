@@ -3,7 +3,7 @@ import { ObjectId } from "mongodb";
 import { z } from "zod";
 import { getDatabase } from "../config/database.js";
 import { requireAuth, requireRole } from "../middleware/authorize.js";
-import { ensureServiceCategories, listServiceCategories } from "../lib/service-categories.js";
+import { ensureServiceCategories, listServiceCategories, listCategoryDetails } from "../lib/service-categories.js";
 
 export const adminServicesRouter = Router();
 adminServicesRouter.use(requireAuth, requireRole("admin"));
@@ -49,6 +49,64 @@ adminServicesRouter.post("/categories", async (req, res, next) => {
     await db.collection("serviceCategories").updateOne({ key: name.toLocaleLowerCase("en") },
       { $setOnInsert: { key: name.toLocaleLowerCase("en"), name, isDefault: false, order: 1000, createdAt: new Date() } }, { upsert: true });
     res.status(201).json({ success: true, data: { name, created: true } });
+  } catch (error) { next(error); }
+});
+
+adminServicesRouter.get("/category-details", async (_req, res, next) => {
+  try { res.set("Cache-Control", "no-store").json({ success: true, data: await listCategoryDetails() }); }
+  catch (error) { next(error); }
+});
+
+const categoryEditSchema = z.object({
+  name: z.string().trim().min(2).max(60).regex(/^[\p{L}\p{N}][\p{L}\p{N} &+/,.'()\-]*$/u),
+  image: imageLink,
+}).strict();
+
+adminServicesRouter.patch("/categories/:name", async (req, res, next) => {
+  const parsed = categoryEditSchema.safeParse(req.body);
+  const oldName = typeof req.params.name === "string" ? req.params.name.trim() : "";
+  if (!parsed.success || !oldName) { res.status(400).json({ success: false, message: "Provide a valid category name and uploaded HTTPS image." }); return; }
+  try {
+    await ensureServiceCategories();
+    const db = await getDatabase();
+    const names = await listServiceCategories();
+    const actual = names.find((name) => name.toLocaleLowerCase("en") === oldName.toLocaleLowerCase("en"));
+    if (!actual) { res.status(404).json({ success: false, message: "Category not found." }); return; }
+    const name = parsed.data.name.replace(/\s+/g, " ");
+    if (oldName.toLocaleLowerCase("en") === "miscellaneous" && name.toLocaleLowerCase("en") !== "miscellaneous") { res.status(409).json({ success: false, message: "Miscellaneous cannot be renamed." }); return; }
+    const key = name.toLocaleLowerCase("en");
+    const oldKey = actual.toLocaleLowerCase("en");
+    if (key !== oldKey && names.some((item) => item.toLocaleLowerCase("en") === key)) {
+      res.status(409).json({ success: false, message: "Another category already uses that name." }); return;
+    }
+    const collection = db.collection("serviceCategories");
+    const previous = await collection.findOne({ key: oldKey });
+    if (key !== oldKey) {
+      // Preserve the old category until service references have been migrated.
+      await collection.updateOne({ key }, { $setOnInsert: { name, key, order: previous?.order ?? 1000, createdAt: new Date() } }, { upsert: true });
+      await db.collection("services").updateMany({ category: actual }, { $set: { category: name, updatedAt: new Date() } });
+      await collection.deleteOne({ key: oldKey });
+    }
+    await collection.updateOne({ key }, { $set: { name, image: parsed.data.image, updatedAt: new Date() }, $setOnInsert: { key, order: 1000, createdAt: new Date() } }, { upsert: true });
+    res.json({ success: true, data: { name, image: parsed.data.image } });
+  } catch (error) { next(error); }
+});
+
+adminServicesRouter.delete("/categories/:name", async (req, res, next) => {
+  const requested = typeof req.params.name === "string" ? req.params.name.trim() : "";
+  if (!requested || requested.toLocaleLowerCase("en") === "miscellaneous") {
+    res.status(400).json({ success: false, message: "Miscellaneous is a permanent category and cannot be deleted." }); return;
+  }
+  try {
+    await ensureServiceCategories();
+    const db = await getDatabase();
+    const categories = await listServiceCategories();
+    const actual = categories.find((name) => name.toLocaleLowerCase("en") === requested.toLocaleLowerCase("en"));
+    if (!actual) { res.status(404).json({ success: false, message: "Category not found." }); return; }
+    // Move all associated services before removing the category record.
+    const moved = await db.collection("services").updateMany({ category: actual }, { $set: { category: "Miscellaneous", updatedAt: new Date() } });
+    await db.collection("serviceCategories").deleteOne({ key: actual.toLocaleLowerCase("en") });
+    res.json({ success: true, message: "Category deleted; services moved to Miscellaneous.", data: { moved: moved.modifiedCount } });
   } catch (error) { next(error); }
 });
 

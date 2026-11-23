@@ -2,7 +2,7 @@ import { getDatabase } from "../config/database.js";
 
 export const DEFAULT_CATEGORIES = [
   "Haircut & Styling", "Hair Coloring", "Hair Treatment", "Facial & Skincare",
-  "Makeup", "Manicure & Pedicure", "Spa & Massage",
+  "Makeup", "Manicure & Pedicure", "Spa & Massage", "Miscellaneous",
 ] as const;
 
 let seeded: Promise<void> | null = null;
@@ -11,7 +11,12 @@ export async function ensureServiceCategories() {
     const db = await getDatabase();
     const collection = db.collection("serviceCategories");
     await collection.createIndex({ key: 1 }, { unique: true });
-    await collection.bulkWrite(DEFAULT_CATEGORIES.map((name, order) => ({
+    const isNew = (await collection.countDocuments({})) === 0;
+    await collection.bulkWrite(DEFAULT_CATEGORIES.filter((name) => name === "Miscellaneous").map((name) => ({
+      updateOne: { filter: { key: name.toLocaleLowerCase("en") },
+        update: { $setOnInsert: { name, key: name.toLocaleLowerCase("en"), order: 9999, isDefault: true, createdAt: new Date() } }, upsert: true },
+    })), { ordered: false });
+    if (isNew) await collection.bulkWrite(DEFAULT_CATEGORIES.filter((name) => name !== "Miscellaneous").map((name, order) => ({
       updateOne: { filter: { key: name.toLocaleLowerCase("en") },
         update: { $setOnInsert: { name, key: name.toLocaleLowerCase("en"), order, isDefault: true, createdAt: new Date() } }, upsert: true },
     })), { ordered: false });
@@ -33,4 +38,15 @@ export async function listServiceCategories() {
     if (!result.has(normalized.toLocaleLowerCase("en"))) result.set(normalized.toLocaleLowerCase("en"), normalized);
   }
   return [...result.values()];
+}
+
+export async function listCategoryDetails() {
+  await ensureServiceCategories();
+  const db = await getDatabase();
+  const [saved, names] = await Promise.all([
+    db.collection("serviceCategories").find({}, { projection: { _id: 0, name: 1, image: 1 } }).sort({ order: 1, name: 1 }).toArray(),
+    listServiceCategories(),
+  ]);
+  const byName = new Map(saved.map((row) => [String(row.name).toLocaleLowerCase("en"), row]));
+  return names.map((name) => ({ name, image: typeof byName.get(name.toLocaleLowerCase("en"))?.image === "string" ? String(byName.get(name.toLocaleLowerCase("en"))?.image) : "" }));
 }

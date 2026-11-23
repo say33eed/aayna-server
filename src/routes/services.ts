@@ -1,9 +1,14 @@
 import { Router } from "express";
 import { createHash } from "node:crypto";
 import { getDatabase } from "../config/database.js";
-import { listServiceCategories } from "../lib/service-categories.js";
+import { listServiceCategories, listCategoryDetails } from "../lib/service-categories.js";
 
 export const servicesRouter = Router();
+
+servicesRouter.get("/category-details", async (_req, res) => {
+  try { res.set("Cache-Control", "no-store").json({ success: true, data: await listCategoryDetails() }); }
+  catch { res.status(503).json({ success: false, message: "Categories are temporarily unavailable." }); }
+});
 
 servicesRouter.get("/categories", async (_req, res) => {
   try { res.set("Cache-Control", "no-store").json({ success: true, data: await listServiceCategories() }); }
