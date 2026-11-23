@@ -9,6 +9,7 @@ import { adminServicesRouter } from "./routes/admin-services.js";
 import { adminOverviewRouter } from "./routes/admin-overview.js";
 import { appointmentsRouter } from "./routes/appointments.js";
 import { healthRouter } from "./routes/health.js";
+import { profileRouter } from "./routes/profile.js";
 import { paymentsRouter, stripeWebhook } from "./routes/payments.js";
 import { requireAuth, issueApiToken } from "./middleware/authorize.js";
 import { errorHandler, notFound } from "./middleware/error-handler.js";
@@ -33,6 +34,7 @@ app.use(cors({
 app.all("/api/auth/*", toNodeHandler(auth));
 app.post("/api/payments/webhook", express.raw({ type: "application/json", limit: "100kb" }), stripeWebhook);
 app.use("/api/admin/services/image", express.json({ limit: "8mb" }));
+app.use("/api/profile/image", express.json({ limit: "8mb" }));
 app.use(express.json({ limit: "100kb" }));
 
 app.get("/", (_req, res) => {
@@ -45,6 +47,7 @@ app.post("/api/session/token", requireAuth, (req, res) => {
   res.set("Cache-Control", "no-store").json({ success: true, data: { token: issueApiToken(req.authenticatedUser!.id), expiresIn: 900 } });
 });
 
+app.use("/api/profile", profileRouter);
 app.use("/api/services", servicesRouter);
 app.use("/api/appointments", appointmentsRouter);
 app.use("/api/admin/overview", adminOverviewRouter);
