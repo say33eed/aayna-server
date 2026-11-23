@@ -34,7 +34,7 @@ Node.js 22, Express 4, TypeScript, MongoDB native driver, Better Auth, Stripe SD
 ## Installation and local development
 
 ```powershell
-git clone https://github.com/say33eed/aayna-client
+git clone https://github.com/say33eed/aayna-server
 cd aayna-server
 npm ci
 ```
