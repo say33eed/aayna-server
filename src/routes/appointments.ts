@@ -26,7 +26,7 @@ appointmentsRouter.get("/slots", async (req, res) => {
     const db = await getDatabase();
     const service = await db.collection("services").findOne({ _id: new ObjectId(serviceId), status: "active" }, { projection: { _id: 1 } });
     if (!service) { res.status(404).json({ success: false, message: "Service is unavailable." }); return; }
-    const taken = await db.collection("appointments").find({ serviceId, appointmentDate: date, status: { $in: ["pending", "confirmed"] } }, { projection: { timeSlot: 1 } }).toArray();
+    const taken = await db.collection("appointments").find({ serviceId, appointmentDate: date, status: "confirmed" }, { projection: { timeSlot: 1 } }).toArray();
     const occupied = new Set(taken.map((row) => row.timeSlot));
     res.set("Cache-Control", "no-store").json({ success: true, data: TIME_SLOTS.map((time) => ({ time, available: !occupied.has(time) && isUpcomingSlot(date, time) })) });
   } catch { res.status(503).json({ success: false, message: "Unable to load time slots." }); }
@@ -139,8 +139,19 @@ appointmentsRouter.patch("/admin/:id/status", requireAuth, requireRole("admin"),
     const current = await appointments.findOne({ _id: key }, { projection: { status: 1, paymentStatus: 1, checkoutExpiresAt: 1 } });
     if (!current) { res.status(404).json({ success: false, message: "Appointment not found." }); return; }
     if (action === "confirm") {
-      const result = await appointments.updateOne({ _id: key, status: "pending" }, { $set: { status: "confirmed", updatedAt: now } });
-      res.status(result.modifiedCount ? 200 : 409).json({ success: Boolean(result.modifiedCount), message: result.modifiedCount ? "Appointment confirmed." : "Only pending appointments can be confirmed." }); return;
+      // Legacy pending requests may still carry slotKey from earlier releases. They must not reserve slots.
+      await appointments.updateMany({ status: "pending", slotKey: { $exists: true } }, { $unset: { slotKey: "" } });
+      await appointments.createIndex({ slotKey: 1 }, { unique: true, partialFilterExpression: { slotKey: { $type: "string" } } });
+      const requested = await appointments.findOne({ _id: key, status: "pending" }, { projection: { serviceId: 1, appointmentDate: 1, timeSlot: 1 } });
+      if (!requested) { res.status(409).json({ success: false, message: "Only pending appointments can be confirmed." }); return; }
+      const slotKey = `${requested.serviceId}:${requested.appointmentDate}:${requested.timeSlot}`;
+      try {
+        const result = await appointments.updateOne({ _id: key, status: "pending" }, { $set: { status: "confirmed", slotKey, updatedAt: now } });
+        res.status(result.modifiedCount ? 200 : 409).json({ success: Boolean(result.modifiedCount), message: result.modifiedCount ? "Appointment confirmed." : "Appointment changed. Please refresh." }); return;
+      } catch (error) {
+        if (error instanceof MongoServerError && error.code === 11000) { res.status(409).json({ success: false, message: "Another appointment is already confirmed for this service, date and time." }); return; }
+        throw error;
+      }
     }
     if (current.status !== "pending" && current.status !== "confirmed") {
       res.status(409).json({ success: false, message: "This appointment is already cancelled." }); return;
@@ -183,13 +194,10 @@ appointmentsRouter.post("/", requireAuth, requireRole("customer"), async (req, r
     if (!service) { res.status(404).json({ success: false, message: "This service is no longer available." }); return; }
     if (typeof service.price !== "number" || !Number.isFinite(service.price) || service.price < 0) { res.status(422).json({ success: false, message: "Service price is invalid." }); return; }
     const appointments = db.collection("appointments");
-    // A unique slotKey prevents concurrent duplicate requests; cancellation must unset slotKey.
-    await appointments.createIndex({ slotKey: 1 }, { unique: true, partialFilterExpression: { slotKey: { $type: "string" } } });
     const record = {
       serviceId, customerId: user.id, appointmentDate, timeSlot,
       message: typeof message === "string" ? message.trim() : "",
       servicePrice: service.price, paymentStatus: "unpaid", status: "pending",
-      slotKey: `${serviceId}:${appointmentDate}:${timeSlot}`,
       createdAt: new Date(),
     };
     const result = await appointments.insertOne(record);
