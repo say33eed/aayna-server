@@ -1,4 +1,5 @@
 import express from "express";
+import { journalRouter, adminJournalRouter } from "./routes/journal.js";
 import { toNodeHandler } from "better-auth/node";
 import { auth } from "./auth.js";
 import cors from "cors";
@@ -49,6 +50,8 @@ app.post("/api/session/token", requireAuth, (req, res) => {
   res.set("Cache-Control", "no-store").json({ success: true, data: { token: issueApiToken(req.authenticatedUser!.id), expiresIn: 900 } });
 });
 
+app.use("/api/journal", journalRouter);
+app.use("/api/admin/journal", adminJournalRouter);
 app.use("/api/services", servicesRouter);
 app.use("/api/appointments", appointmentsRouter);
 app.use("/api/admin/overview", adminOverviewRouter);
