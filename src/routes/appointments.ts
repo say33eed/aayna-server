@@ -134,14 +134,20 @@ appointmentsRouter.patch("/admin/:id/status", requireAuth, requireRole("admin"),
   }
   try {
     const appointments = (await getDatabase()).collection("appointments");
-    const filter = { _id: new ObjectId(id), status: action === "confirm" ? "pending" : { $in: ["pending", "confirmed"] } };
+    const filter = action === "confirm"
+      ? { _id: new ObjectId(id), status: "pending" }
+      : { _id: new ObjectId(id), status: { $in: ["pending", "confirmed"] },
+          paymentStatus: "unpaid", $or: [
+            { checkoutExpiresAt: { $exists: false } },
+            { checkoutExpiresAt: { $lte: new Date() } },
+          ] };
     const update = action === "confirm"
       ? { $set: { status: "confirmed", updatedAt: new Date() } }
       : { $set: { status: "cancelled", updatedAt: new Date() }, $unset: { slotKey: "" } };
     const result = await appointments.updateOne(filter, update);
     if (result.modifiedCount) { res.set("Cache-Control", "no-store").json({ success: true, message: action === "confirm" ? "Appointment confirmed." : "Appointment cancelled." }); return; }
     const exists = await appointments.findOne({ _id: new ObjectId(id) }, { projection: { _id: 1 } });
-    res.status(exists ? 409 : 404).json({ success: false, message: exists ? "This appointment can no longer be changed." : "Appointment not found." });
+    res.status(exists ? 409 : 404).json({ success: false, message: exists ? "This appointment cannot be changed while payment is pending or completed." : "Appointment not found." });
   } catch { res.status(503).json({ success: false, message: "Unable to update appointment." }); }
 });
 

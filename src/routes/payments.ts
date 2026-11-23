@@ -27,13 +27,34 @@ paymentsRouter.post("/checkout/:appointmentId", requireAuth, requireRole("custom
   }
   try {
     const db = await getDatabase();
-    const appointment = await db.collection("appointments").findOne({
-      _id: new ObjectId(id), customerId: req.authenticatedUser!.id,
-      status: "confirmed", paymentStatus: "unpaid",
+    const appointments = db.collection("appointments");
+    const appointmentKey = new ObjectId(id);
+    const customerId = req.authenticatedUser!.id;
+    const now = new Date();
+    // A single atomic lease prevents concurrent checkout creation for one appointment.
+    // Expired leases can be reclaimed; existing Stripe sessions are reused when possible.
+    const appointment = await appointments.findOne({
+      _id: appointmentKey, customerId, status: "confirmed", paymentStatus: "unpaid",
     });
     if (!appointment) {
       res.status(409).json({ success: false, message: "Only your confirmed, unpaid appointments can be paid." }); return;
     }
+    if (appointment.checkoutExpiresAt instanceof Date && appointment.checkoutExpiresAt > now) {
+      if (typeof appointment.checkoutUrl === "string" && appointment.checkoutUrl.startsWith("https://")) {
+        res.set("Cache-Control", "no-store").json({ success: true, data: { url: appointment.checkoutUrl } }); return;
+      }
+      res.status(409).json({ success: false, message: "Checkout is being prepared. Please try again shortly." }); return;
+    }
+    const leaseUntil = new Date(Date.now() + 31 * 60 * 1000);
+    const lock = await appointments.updateOne({
+      _id: appointmentKey, customerId, status: "confirmed", paymentStatus: "unpaid",
+      $or: [{ checkoutExpiresAt: { $exists: false } }, { checkoutExpiresAt: { $lte: now } }],
+    }, { $set: { checkoutExpiresAt: leaseUntil, updatedAt: now }, $unset: { checkoutUrl: "" } });
+    if (!lock.modifiedCount) {
+      res.status(409).json({ success: false, message: "Checkout is already in progress. Please try again shortly." }); return;
+    }
+    let sessionCreated = false;
+    try {
     const unitAmount = toMinorUnits(appointment.servicePrice);
     if (!unitAmount) {
       res.status(422).json({ success: false, message: "Invalid appointment price." }); return;
@@ -52,7 +73,19 @@ paymentsRouter.post("/checkout/:appointmentId", requireAuth, requireRole("custom
       expires_at: Math.floor(Date.now() / 1000) + 30 * 60,
     });
     if (!session.url) throw new Error("Stripe did not return a checkout URL.");
+    sessionCreated = true;
+    await appointments.updateOne({ _id: appointmentKey, checkoutExpiresAt: leaseUntil }, {
+      $set: { checkoutUrl: session.url, stripeCheckoutSessionId: session.id },
+    });
     res.set("Cache-Control", "no-store").json({ success: true, data: { url: session.url } });
+    } catch (checkoutError) {
+      // If Stripe created a session but MongoDB failed, keep the lease to prevent a
+      // second chargeable session; the webhook can still reconcile the first one.
+      if (!sessionCreated) await appointments.updateOne({ _id: appointmentKey, checkoutExpiresAt: leaseUntil },
+        { $unset: { checkoutExpiresAt: "", checkoutUrl: "" } }).catch(() => undefined);
+      throw checkoutError;
+    }
+
   } catch (error) {
     const message = error instanceof Error && /Stripe test secret key/.test(error.message)
       ? "Stripe test mode is not configured." : "Unable to start Stripe Checkout. Check that BDT is enabled in your sandbox.";
@@ -85,19 +118,35 @@ export async function stripeWebhook(req: Request, res: Response): Promise<void> 
   try {
     const db = await getDatabase();
     const appointments = db.collection("appointments");
-    const appointment = await appointments.findOne({ _id: new ObjectId(appointmentId), customerId });
-    if (!appointment || appointment.status !== "confirmed" || toMinorUnits(appointment.servicePrice) !== session.amount_total) {
-      res.status(409).json({ success: false, message: "Payment does not match a confirmed appointment." }); return;
+    const appointmentKey = new ObjectId(appointmentId);
+    const appointment = await appointments.findOne({ _id: appointmentKey, customerId });
+    if (!appointment || toMinorUnits(appointment.servicePrice) !== session.amount_total) {
+      res.status(409).json({ success: false, message: "Payment does not match an appointment." }); return;
     }
+    // Never silently discard a verified charge, including a late payment after cancellation.
+    // Record it for reconciliation even if the appointment cannot be marked paid.
     const transactions = db.collection("transactions");
     await transactions.createIndex({ stripeSessionId: 1 }, { unique: true });
     await transactions.updateOne({ stripeSessionId: session.id }, { $setOnInsert: {
       appointmentId, customerId, amount: appointment.servicePrice, currency,
       stripeSessionId: session.id, status: "paid", createdAt: new Date(),
     } }, { upsert: true });
-    await appointments.updateOne({ _id: new ObjectId(appointmentId), customerId, status: "confirmed", paymentStatus: "unpaid" }, {
+    if (appointment.status !== "confirmed") {
+      // A verified payment on a cancelled appointment requires manual refund review.
+      await transactions.updateOne({ stripeSessionId: session.id },
+        { $set: { reconciliationStatus: "refund_review", updatedAt: new Date() } });
+      res.status(200).json({ received: true, reconciliationRequired: true }); return;
+    }
+    await appointments.updateOne({ _id: appointmentKey, customerId, status: "confirmed", paymentStatus: "unpaid" }, {
       $set: { paymentStatus: "paid", paidAt: new Date(), updatedAt: new Date() },
+      $unset: { checkoutExpiresAt: "", checkoutUrl: "" },
     });
+    // A repeated webhook repairs a partially completed write without duplicating the transaction.
+    const current = await appointments.findOne({ _id: appointmentKey, customerId }, { projection: { paymentStatus: 1, status: 1 } });
+    if (current?.paymentStatus !== "paid") {
+      await transactions.updateOne({ stripeSessionId: session.id },
+        { $set: { reconciliationStatus: "refund_review", updatedAt: new Date() } });
+    }
     res.status(200).json({ received: true });
   } catch {
     // Non-2xx response lets Stripe retry delivery after a temporary database failure.
