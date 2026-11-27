@@ -80,3 +80,17 @@ Before submission, confirm `/health`, authentication, protected routes, service 
 ## Security
 
 Keep `.env` and credentials out of Git. Protect administrative endpoints with server-side role verification; never trust client-only authorization. Payment status must be updated only after verified Stripe webhook events.
+
+## Public API documentation
+
+Open `/` or `/docs` for the interactive reference and `/openapi.json` for the OpenAPI 3.1 contract. The public explorer executes only selected unauthenticated GET requests. Swagger operations are read-only, including protected routes. Better Auth library-managed routes are described separately in its official documentation.
+
+## Production readiness (Phase 4)
+
+Production requires HTTPS origins, a complete auth/OAuth configuration, Stripe test-mode credentials and ImgBB configuration. Startup checks MongoDB connectivity and creates the confirmed-slot and Stripe-session unique indexes before listening. `/health/ready` returns 503 when database readiness fails; `/health` retains its original compatibility contract.
+
+Before deployment, back up the database and inspect duplicate confirmed slots and duplicate Stripe session references. Do not delete payment history to resolve conflicts. Check legacy service IDs for canonical lowercase string ObjectIds; the index does not normalize historical records. Resolve discrepancies manually with an administrator before restarting. The application does not migrate or delete records during startup.
+
+Run `npm run build` then `node --test tests/security.test.mjs` for configuration regression tests. These tests do not connect to MongoDB or Stripe. Test concurrent confirmations, logout revocation, webhook retries and upload limits against a separate staging database and Stripe test account.
+
+Keep Express trust proxy disabled until the hosting provider's trusted proxy topology is verified. Shared proxy addresses can aggregate IP-based limits; never enable unrestricted trust proxy. Configure provider-side request limits as well. This version remains Stripe test-mode only and is not certified for real-money use.

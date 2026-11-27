@@ -1,4 +1,5 @@
 import { betterAuth } from "better-auth";
+import { APIError, createAuthMiddleware } from "better-auth/api";
 import { mongodbAdapter } from "better-auth/adapters/mongodb";
 import { getMongoClient } from "./config/database.js";
 import { env, isAuthConfigured, isGoogleAuthConfigured } from "./config/env.js";
@@ -18,7 +19,18 @@ export const auth = betterAuth({
   database: mongodbAdapter(getMongoClient().db("aayna")),
   emailAndPassword: {
     enabled: true,
-    minPasswordLength: 6,
+    minPasswordLength: 12,
+  },
+  hooks: {
+    before: createAuthMiddleware(async (ctx) => {
+      const field = ctx.path === "/sign-up/email" ? "password" :
+        ["/change-password", "/reset-password", "/set-password"].includes(ctx.path) ? "newPassword" : null;
+      if (!field) return;
+      const password = ctx.body?.[field];
+      if (typeof password !== "string" || password.length < 12 || !/[A-Z]/.test(password) || !/[a-z]/.test(password)) {
+        throw new APIError("BAD_REQUEST", { message: "Use at least 12 characters with uppercase and lowercase letters." });
+      }
+    }),
   },
   socialProviders,
   // Auth is exposed via the Vercel same-origin proxy. OAuth callbacks and

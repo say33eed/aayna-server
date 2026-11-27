@@ -65,8 +65,19 @@ export async function getDatabase() {
 export async function closeDatabase() {
   await client?.close();
 
+  indexesReady = undefined;
   client = undefined;
   pending = undefined;
   last = false;
   checked = 0;
+}
+
+let indexesReady: Promise<void> | undefined;
+export function ensureBusinessIndexes(): Promise<void> {
+  indexesReady ??= (async () => {
+    const db = await getDatabase();
+    await db.collection("appointments").createIndex({ serviceId: 1, appointmentDate: 1, timeSlot: 1 }, { name: "confirmed_slot_unique", unique: true, partialFilterExpression: { status: "confirmed" } });
+    await db.collection("transactions").createIndex({ stripeSessionId: 1 }, { unique: true });
+  })().catch((error: unknown) => { indexesReady = undefined; throw error; });
+  return indexesReady;
 }

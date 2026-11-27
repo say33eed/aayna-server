@@ -7,7 +7,7 @@ import { env } from "../config/env.js";
 import { getDatabase } from "../config/database.js";
 
 export type UserRole = "customer" | "admin";
-export type AuthenticatedUser = { id: string; role: UserRole; isBlocked: boolean };
+export type AuthenticatedUser = { id: string; role: UserRole; isBlocked: boolean; sessionId: string; viaBearer: boolean };
 declare global { namespace Express { interface Request { authenticatedUser?: AuthenticatedUser } } }
 
 // A domain-separated signing key avoids reusing the Better Auth secret directly as a JWT key.
@@ -24,33 +24,51 @@ function requestHeaders(req: Request): Headers {
   return headers;
 }
 
-export function issueApiToken(userId: string): string {
-  return jwt.sign({}, jwtKey, { algorithm: "HS256", subject: userId, issuer, audience, expiresIn: "15m" });
+export function issueApiToken(userId: string, sessionId: string): string {
+  return jwt.sign({ sid: sessionId }, jwtKey, { algorithm: "HS256", subject: userId, issuer, audience, expiresIn: "15m" });
 }
 
-// Checks signature, algorithm, issuer, audience, expiry, and subject.
-export function verifyApiJwt(token: string): string | null {
+type Identity = { id: string; sessionId: string; viaBearer: boolean };
+
+export function verifyApiJwt(token: string): Identity | null {
   try {
     const payload = jwt.verify(token, jwtKey, { algorithms: ["HS256"], issuer, audience }) as JwtPayload;
-    return typeof payload.sub === "string" && payload.sub.length > 0 ? payload.sub : null;
+    if (typeof payload.sub !== "string" || !payload.sub || typeof payload.sid !== "string" || !payload.sid || typeof payload.exp !== "number") return null;
+    return { id: payload.sub, sessionId: payload.sid, viaBearer: true };
   } catch { return null; }
 }
 
-async function identify(req: Request): Promise<string | null> {
+async function identify(req: Request): Promise<Identity | null> {
   const authorization = req.headers.authorization;
   if (authorization !== undefined) {
     const match = /^Bearer (\S+)$/i.exec(authorization);
-    return match ? verifyApiJwt(match[1]!) : null; // Never fall back on a malformed bearer token.
+    return match ? verifyApiJwt(match[1]!) : null;
   }
   const session = await auth.api.getSession({ headers: requestHeaders(req) });
-  return session?.user?.id ?? null;
+  return session?.user?.id && session.session?.id
+    ? { id: session.user.id, sessionId: session.session.id, viaBearer: false } : null;
+}
+
+function idCandidates(id: string): Array<string | ObjectId> {
+  const values: Array<string | ObjectId> = [id];
+  if (ObjectId.isValid(id) && String(new ObjectId(id)) === id.toLowerCase()) values.push(new ObjectId(id));
+  return values;
 }
 
 export const requireAuth: RequestHandler = async (req, res, next) => {
   try {
-    const id = await identify(req);
-    if (!id) { res.status(401).json({ success: false, message: "Please sign in." }); return; }
+    const identity = await identify(req);
+    if (!identity) { res.status(401).json({ success: false, message: "Please sign in." }); return; }
     const db = await getDatabase();
+    const { id, sessionId, viaBearer } = identity;
+    if (viaBearer) {
+      const active = await db.collection("session").findOne({
+        _id: { $in: idCandidates(sessionId) as ObjectId[] },
+        userId: { $in: idCandidates(id) },
+        expiresAt: { $gt: new Date() },
+      }, { projection: { _id: 1 } });
+      if (!active) { res.status(401).json({ success: false, message: "Session expired. Please sign in." }); return; }
+    }
     // Better Auth uses string IDs; support legacy ObjectId records defensively.
     const candidates: Array<string | ObjectId> = [id];
     if (ObjectId.isValid(id) && String(new ObjectId(id)) === id.toLowerCase()) candidates.push(new ObjectId(id));
@@ -59,7 +77,7 @@ export const requireAuth: RequestHandler = async (req, res, next) => {
     if (record.isBlocked === true) { res.status(403).json({ success: false, message: "Account access is restricted." }); return; }
     const role = record.role === "admin" ? "admin" : record.role === "customer" || record.role == null ? "customer" : null;
     if (!role) { res.status(403).json({ success: false, message: "Invalid account role." }); return; }
-    req.authenticatedUser = { id, role, isBlocked: false };
+    req.authenticatedUser = { id, role, isBlocked: false, sessionId, viaBearer };
     next();
   } catch (error) { next(error); }
 };

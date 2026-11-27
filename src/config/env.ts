@@ -12,6 +12,10 @@ function parsePort(value: string | undefined): number {
   return port;
 }
 
+function validOrigin(value: string): boolean {
+  try { const url = new URL(value); return ["http:", "https:"].includes(url.protocol) && url.origin === value; } catch { return false; }
+}
+
 function parseOrigins(value: string): string[] {
   const origins = value
     .split(",")
@@ -21,7 +25,7 @@ function parseOrigins(value: string): string[] {
   if (
     origins.length === 0 ||
     origins.some(
-      (origin) => !/^https?:\/\/[^/]+$/.test(origin)
+      (origin) => !validOrigin(origin)
     )
   ) {
     throw new Error(
@@ -75,4 +79,14 @@ export function isGoogleAuthConfigured(): boolean {
     env.auth.googleClientId &&
     env.auth.googleClientSecret
   );
+}
+
+// Fail closed on unsafe production configuration; never include secret values in errors.
+if (env.nodeEnv === "production") {
+  if (!isAuthConfigured()) throw new Error("Production authentication configuration is incomplete.");
+  if (!env.clientOrigins.every(origin => origin.startsWith("https://"))) throw new Error("Production CLIENT_ORIGIN must use HTTPS.");
+  if (!env.auth.baseURL || !validOrigin(env.auth.baseURL) || !env.auth.baseURL.startsWith("https://")) throw new Error("Production BETTER_AUTH_URL must be an HTTPS origin.");
+  if (!isGoogleAuthConfigured()) throw new Error("Production Google OAuth configuration is incomplete.");
+  if (!process.env.STRIPE_SECRET_KEY?.trim().startsWith("sk_test_") || !process.env.STRIPE_WEBHOOK_SECRET?.trim().startsWith("whsec_")) throw new Error("Production Stripe test-mode configuration is incomplete.");
+  if (!process.env.IMGBB_API_KEY?.trim()) throw new Error("Production image hosting configuration is incomplete.");
 }

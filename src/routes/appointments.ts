@@ -1,7 +1,9 @@
 import { Router } from "express";
 import { ObjectId, MongoServerError } from "mongodb";
 import { requireAuth, requireRole } from "../middleware/authorize.js";
-import { getDatabase } from "../config/database.js";
+import { getDatabase, ensureBusinessIndexes } from "../config/database.js";
+
+import { rateLimit } from "../middleware/rate-limit.js";
 
 export const appointmentsRouter = Router();
 export const TIME_SLOTS = ["09:00", "10:00", "11:00", "12:00", "14:00", "15:00", "16:00", "17:00"] as const;
@@ -26,7 +28,7 @@ appointmentsRouter.get("/slots", async (req, res) => {
     const db = await getDatabase();
     const service = await db.collection("services").findOne({ _id: new ObjectId(serviceId), status: "active" }, { projection: { _id: 1 } });
     if (!service) { res.status(404).json({ success: false, message: "Service is unavailable." }); return; }
-    const taken = await db.collection("appointments").find({ serviceId, appointmentDate: date, status: "confirmed" }, { projection: { timeSlot: 1 } }).toArray();
+    const taken = await db.collection("appointments").find({ serviceId: String(service._id), appointmentDate: date, status: "confirmed" }, { projection: { timeSlot: 1 } }).toArray();
     const occupied = new Set(taken.map((row) => row.timeSlot));
     res.set("Cache-Control", "no-store").json({ success: true, data: TIME_SLOTS.map((time) => ({ time, available: !occupied.has(time) && isUpcomingSlot(date, time) })) });
   } catch { res.status(503).json({ success: false, message: "Unable to load time slots." }); }
@@ -139,11 +141,13 @@ appointmentsRouter.patch("/admin/:id/status", requireAuth, requireRole("admin"),
     const current = await appointments.findOne({ _id: key }, { projection: { status: 1, paymentStatus: 1, checkoutExpiresAt: 1 } });
     if (!current) { res.status(404).json({ success: false, message: "Appointment not found." }); return; }
     if (action === "confirm") {
-      // Legacy pending requests may still carry slotKey from earlier releases. They must not reserve slots.
+      // Index the actual confirmed slot, including legacy records without slotKey.
+      // Existing duplicate confirmations must be reconciled before this index can be created.
+      await ensureBusinessIndexes();
       await appointments.updateMany({ status: "pending", slotKey: { $exists: true } }, { $unset: { slotKey: "" } });
-      await appointments.createIndex({ slotKey: 1 }, { unique: true, partialFilterExpression: { slotKey: { $type: "string" } } });
       const requested = await appointments.findOne({ _id: key, status: "pending" }, { projection: { serviceId: 1, appointmentDate: 1, timeSlot: 1 } });
       if (!requested) { res.status(409).json({ success: false, message: "Only pending appointments can be confirmed." }); return; }
+      if (!validDate(requested.appointmentDate) || !TIME_SLOTS.includes(requested.timeSlot) || !isUpcomingSlot(requested.appointmentDate, requested.timeSlot)) { res.status(409).json({ success: false, message: "This appointment time has passed or is invalid." }); return; }
       const slotKey = `${requested.serviceId}:${requested.appointmentDate}:${requested.timeSlot}`;
       try {
         const result = await appointments.updateOne({ _id: key, status: "pending" }, { $set: { status: "confirmed", slotKey, updatedAt: now } });
@@ -179,7 +183,7 @@ appointmentsRouter.patch("/admin/:id/status", requireAuth, requireRole("admin"),
   } catch { res.status(503).json({ success: false, message: "Unable to update appointment." }); }
 });
 
-appointmentsRouter.post("/", requireAuth, requireRole("customer"), async (req, res) => {
+appointmentsRouter.post("/", requireAuth, requireRole("customer"), rateLimit("booking", 20, 3600, true), async (req, res) => {
   try {
     const user = req.authenticatedUser!;
     const { serviceId, appointmentDate, timeSlot, message } = req.body ?? {};
@@ -194,8 +198,10 @@ appointmentsRouter.post("/", requireAuth, requireRole("customer"), async (req, r
     if (!service) { res.status(404).json({ success: false, message: "This service is no longer available." }); return; }
     if (typeof service.price !== "number" || !Number.isFinite(service.price) || service.price < 0) { res.status(422).json({ success: false, message: "Service price is invalid." }); return; }
     const appointments = db.collection("appointments");
+    const canonicalServiceId = String(service._id);
+    if (await appointments.findOne({ serviceId: canonicalServiceId, appointmentDate, timeSlot, status: "confirmed" }, { projection: { _id: 1 } })) { res.status(409).json({ success: false, message: "This slot is already confirmed." }); return; }
     const record = {
-      serviceId, customerId: user.id, appointmentDate, timeSlot,
+      serviceId: canonicalServiceId, customerId: user.id, appointmentDate, timeSlot,
       message: typeof message === "string" ? message.trim() : "",
       servicePrice: service.price, paymentStatus: "unpaid", status: "pending",
       createdAt: new Date(),

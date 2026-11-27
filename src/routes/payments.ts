@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import Stripe from "stripe";
 import { ObjectId } from "mongodb";
 import { requireAuth, requireRole } from "../middleware/authorize.js";
-import { getDatabase } from "../config/database.js";
+import { getDatabase, ensureBusinessIndexes } from "../config/database.js";
 import { env } from "../config/env.js";
 
 export const paymentsRouter = Router();
@@ -53,7 +53,7 @@ paymentsRouter.post("/checkout/:appointmentId", requireAuth, requireRole("custom
     if (!lock.modifiedCount) {
       res.status(409).json({ success: false, message: "Checkout is already in progress. Please try again shortly." }); return;
     }
-    let sessionCreated = false;
+    let stripeRequestStarted = false;
     try {
     const unitAmount = toMinorUnits(appointment.servicePrice);
     if (!unitAmount) {
@@ -63,6 +63,7 @@ paymentsRouter.post("/checkout/:appointmentId", requireAuth, requireRole("custom
       ? await db.collection("services").findOne({ _id: new ObjectId(appointment.serviceId) }, { projection: { serviceName: 1, name: 1, title: 1 } }) : null;
     const serviceName = String(service?.serviceName ?? service?.name ?? service?.title ?? "Aayna salon appointment").slice(0, 120);
     const clientOrigin = env.clientOrigins[0];
+    stripeRequestStarted = true;
     const session = await stripe().checkout.sessions.create({
       mode: "payment", 
       client_reference_id: id,
@@ -71,9 +72,8 @@ paymentsRouter.post("/checkout/:appointmentId", requireAuth, requireRole("custom
       success_url: `${clientOrigin}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${clientOrigin}/payment/cancel`,
       expires_at: Math.floor(Date.now() / 1000) + 30 * 60,
-    });
+    }, { idempotencyKey: `aayna-checkout-${id}-${leaseUntil.getTime()}` });
     if (!session.url) throw new Error("Stripe did not return a checkout URL.");
-    sessionCreated = true;
     await appointments.updateOne({ _id: appointmentKey, checkoutExpiresAt: leaseUntil }, {
       $set: { checkoutUrl: session.url, stripeCheckoutSessionId: session.id },
     });
@@ -81,7 +81,7 @@ paymentsRouter.post("/checkout/:appointmentId", requireAuth, requireRole("custom
     } catch (checkoutError) {
       // If Stripe created a session but MongoDB failed, keep the lease to prevent a
       // second chargeable session; the webhook can still reconcile the first one.
-      if (!sessionCreated) await appointments.updateOne({ _id: appointmentKey, checkoutExpiresAt: leaseUntil },
+      if (!stripeRequestStarted) await appointments.updateOne({ _id: appointmentKey, checkoutExpiresAt: leaseUntil },
         { $unset: { checkoutExpiresAt: "", checkoutUrl: "" } }).catch(() => undefined);
       throw checkoutError;
     }
@@ -107,7 +107,7 @@ export async function stripeWebhook(req: Request, res: Response): Promise<void> 
     res.status(200).json({ received: true }); return;
   }
   const session = event.data.object as Stripe.Checkout.Session;
-  if (session.payment_status !== "paid" || session.mode !== "payment" || session.currency?.toLowerCase() !== currency) {
+  if (event.livemode || session.livemode || session.payment_status !== "paid" || session.mode !== "payment" || session.currency?.toLowerCase() !== currency) {
     res.status(200).json({ received: true }); return;
   }
   const appointmentId = session.metadata?.appointmentId;
@@ -126,7 +126,7 @@ export async function stripeWebhook(req: Request, res: Response): Promise<void> 
     // Never silently discard a verified charge, including a late payment after cancellation.
     // Record it for reconciliation even if the appointment cannot be marked paid.
     const transactions = db.collection("transactions");
-    await transactions.createIndex({ stripeSessionId: 1 }, { unique: true });
+    await ensureBusinessIndexes();
     await transactions.updateOne({ stripeSessionId: session.id }, { $setOnInsert: {
       appointmentId, customerId, amount: appointment.servicePrice, currency,
       stripeSessionId: session.id, status: "paid", createdAt: new Date(),
@@ -138,12 +138,12 @@ export async function stripeWebhook(req: Request, res: Response): Promise<void> 
       res.status(200).json({ received: true, reconciliationRequired: true }); return;
     }
     await appointments.updateOne({ _id: appointmentKey, customerId, status: "confirmed", paymentStatus: "unpaid" }, {
-      $set: { paymentStatus: "paid", paidAt: new Date(), updatedAt: new Date() },
+      $set: { paymentStatus: "paid", paidStripeSessionId: session.id, paidAt: new Date(), updatedAt: new Date() },
       $unset: { checkoutExpiresAt: "", checkoutUrl: "" },
     });
     // A repeated webhook repairs a partially completed write without duplicating the transaction.
-    const current = await appointments.findOne({ _id: appointmentKey, customerId }, { projection: { paymentStatus: 1, status: 1 } });
-    if (current?.paymentStatus !== "paid") {
+    const current = await appointments.findOne({ _id: appointmentKey, customerId }, { projection: { paymentStatus: 1, status: 1, paidStripeSessionId: 1 } });
+    if (current?.paymentStatus !== "paid" || current.status !== "confirmed" || (current.paidStripeSessionId && current.paidStripeSessionId !== session.id)) {
       await transactions.updateOne({ stripeSessionId: session.id },
         { $set: { reconciliationStatus: "refund_review", updatedAt: new Date() } });
     }
