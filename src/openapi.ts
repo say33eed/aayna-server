@@ -1,7 +1,7 @@
 export const openapi = {
   "openapi": "3.1.0",
   "info": {
-    "title": "Aayna API",
+    "title": "AAYNA API",
     "version": "0.1.0",
     "description": "Salon booking REST API. Better Auth handles /api/auth/* (email/password and Google OAuth); consult https://www.better-auth.com/docs for its library-managed contract. Protected endpoints accept a valid session or JWT. This reference is read-only; public GET requests can be tested in the separate explorer."
   },
